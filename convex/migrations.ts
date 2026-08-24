@@ -310,3 +310,44 @@ export const verify = internalQuery({
     };
   },
 });
+
+/**
+ * Seed / repair the per-outlet `total_revenue:{outletId}` counters that
+ * dashboard.stats reads instead of scanning the outlet's full paid history.
+ * Sums every currently-paid order per outlet and overwrites the counter, so it
+ * is idempotent and safe to re-run any time the counter is suspected to have
+ * drifted.
+ *
+ *   npx convex run migrations:backfillRevenueCounters          # dev
+ *   npx convex run migrations:backfillRevenueCounters --prod   # production
+ */
+export const backfillRevenueCounters = internalMutation({
+  args: {},
+  handler: async (ctx) => {
+    const outlets = await ctx.db.query("outlets").collect();
+    const result: Record<string, { paid_orders: number; total_revenue: number }> = {};
+
+    for (const outlet of outlets) {
+      const paid = await ctx.db
+        .query("restaurant_orders")
+        .withIndex("by_outlet_status", (q) =>
+          q.eq("outlet_id", outlet._id).eq("status", "paid")
+        )
+        .collect();
+      const total = Math.round(paid.reduce((s, o) => s + o.total, 0) * 100) / 100;
+
+      const key = `total_revenue:${outlet._id}`;
+      const existing = await ctx.db
+        .query("counters")
+        .withIndex("by_key", (q) => q.eq("key", key))
+        .first();
+      if (existing) {
+        await ctx.db.patch(existing._id, { value: total });
+      } else {
+        await ctx.db.insert("counters", { key, value: total });
+      }
+      result[outlet.slug] = { paid_orders: paid.length, total_revenue: total };
+    }
+    return result;
+  },
+});

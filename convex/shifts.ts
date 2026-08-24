@@ -2,6 +2,7 @@ import { mutation, query, QueryCtx } from "./_generated/server";
 import { v } from "convex/values";
 import { Id } from "./_generated/dataModel";
 import { requireOutlet } from "./lib/tenant";
+import { collectOpenOrders } from "./lib/openOrders";
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -74,14 +75,7 @@ async function openBillsFor(
   ctx: QueryCtx,
   oid: Id<"outlets">
 ): Promise<OpenBillLite[]> {
-  const recent = await ctx.db
-    .query("restaurant_orders")
-    .withIndex("by_outlet", (q) => q.eq("outlet_id", oid))
-    .order("desc")
-    .take(500);
-  const open = recent.filter(
-    (o) => o.status !== "paid" && o.status !== "cancelled"
-  );
+  const open = await collectOpenOrders(ctx, oid);
   return Promise.all(
     open.map(async (o) => {
       const [payments, table] = await Promise.all([

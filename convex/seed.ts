@@ -165,12 +165,19 @@ export const clearOutletTransactions = internalMutation({
       .collect();
     for (const r of waiterCalls) await ctx.db.delete(r._id);
 
-    // Reset this outlet's order-number counter (next order -> ORD-00001).
-    const counter = await ctx.db
-      .query("counters")
-      .withIndex("by_key", (q) => q.eq("key", `order_number:${oid}`))
-      .first();
-    if (counter) await ctx.db.delete(counter._id);
+    // Reset this outlet's order-number counter (next order -> ORD-00001) and
+    // its revenue counter (all its paid orders were just deleted).
+    let countersReset = 0;
+    for (const key of [`order_number:${oid}`, `total_revenue:${oid}`]) {
+      const counter = await ctx.db
+        .query("counters")
+        .withIndex("by_key", (q) => q.eq("key", key))
+        .first();
+      if (counter) {
+        await ctx.db.delete(counter._id);
+        countersReset += 1;
+      }
+    }
 
     // Free this outlet's tables.
     const tables = await ctx.db
@@ -196,7 +203,7 @@ export const clearOutletTransactions = internalMutation({
         order_payments: payCount,
         restaurant_reservations: reservations.length,
         waiter_calls: waiterCalls.length,
-        order_counter_reset: counter ? 1 : 0,
+        order_counter_reset: countersReset,
         tables_reset_to_available: tablesReset,
       },
     };

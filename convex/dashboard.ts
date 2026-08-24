@@ -1,6 +1,7 @@
 import { query } from "./_generated/server";
 import { v } from "convex/values";
 import { requireOutlet } from "./lib/tenant";
+import { readOutletTotalRevenue } from "./lib/revenue";
 
 export const stats = query({
   args: { token: v.string(), outletId: v.id("outlets") },
@@ -76,14 +77,10 @@ export const stats = query({
       (s) => s.quantity <= s.low_stock_threshold
     ).length;
 
-    // Total revenue from all paid orders, scoped to this outlet.
-    const allPaid = await ctx.db
-      .query("restaurant_orders")
-      .withIndex("by_outlet_status", (q) =>
-        q.eq("outlet_id", oid).eq("status", "paid")
-      )
-      .collect();
-    const totalRevenue = allPaid.reduce((s, o) => s + o.total, 0);
+    // All-time revenue comes from the denormalized counter (one document)
+    // instead of collecting the outlet's entire paid history on every re-run.
+    // Backfill: `npx convex run migrations:backfillRevenueCounters`.
+    const totalRevenue = await readOutletTotalRevenue(ctx, oid);
 
     return {
       today_revenue: todayRevenue,
@@ -129,10 +126,13 @@ export const revenueByDay = query({
   handler: async (ctx, { token, outletId }) => {
     const { outletId: oid } = await requireOutlet(ctx, token, outletId);
 
+    // The chart shows at most 14 days, so only read a bounded recent window
+    // (30 days, to survive gaps) instead of the outlet's full paid history.
+    const windowStart = Date.now() - 30 * 24 * 60 * 60 * 1000;
     const paid = await ctx.db
       .query("restaurant_orders")
-      .withIndex("by_outlet_status", (q) =>
-        q.eq("outlet_id", oid).eq("status", "paid")
+      .withIndex("by_outlet_paid_at", (q) =>
+        q.eq("outlet_id", oid).gte("paid_at", windowStart)
       )
       .collect();
 

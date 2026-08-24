@@ -4,6 +4,8 @@ import { paginationOptsValidator } from "convex/server";
 import { v } from "convex/values";
 import { findOrCreateByPhone } from "./customers";
 import { requireOutlet, assertSameOutlet } from "./lib/tenant";
+import { collectOpenOrders } from "./lib/openOrders";
+import { bumpOutletRevenue } from "./lib/revenue";
 import { verifyPassword } from "./auth";
 
 // A single order line as submitted by a client. Name + price are resolved
@@ -317,15 +319,17 @@ export const tableHistoryToday = query({
     today.setHours(0, 0, 0, 0);
     const todayTs = today.getTime();
 
-    const recent = await ctx.db
+    // _creationTime is a range suffix on every index, so this reads only
+    // today's orders instead of a 500-row window of history.
+    const todays = await ctx.db
       .query("restaurant_orders")
-      .withIndex("by_outlet", (q) => q.eq("outlet_id", oid))
+      .withIndex("by_outlet", (q) =>
+        q.eq("outlet_id", oid).gte("_creationTime", todayTs)
+      )
       .order("desc")
-      .take(500);
+      .collect();
 
-    const forTable = recent.filter(
-      (o) => o.table_id === tableId && o._creationTime >= todayTs
-    );
+    const forTable = todays.filter((o) => o.table_id === tableId);
 
     return Promise.all(
       forTable.map(async (o) => {
@@ -359,15 +363,15 @@ export const tableTotalsToday = query({
     today.setHours(0, 0, 0, 0);
     const todayTs = today.getTime();
 
-    const recent = await ctx.db
+    const todays = await ctx.db
       .query("restaurant_orders")
-      .withIndex("by_outlet", (q) => q.eq("outlet_id", oid))
-      .order("desc")
-      .take(1000);
+      .withIndex("by_outlet", (q) =>
+        q.eq("outlet_id", oid).gte("_creationTime", todayTs)
+      )
+      .collect();
 
     const totals: Record<string, { total: number; count: number }> = {};
-    for (const o of recent) {
-      if (o._creationTime < todayTs) continue;
+    for (const o of todays) {
       if (!o.table_id || o.status === "cancelled") continue;
       const key = o.table_id as string;
       const cur = totals[key] ?? { total: 0, count: 0 };
@@ -389,15 +393,7 @@ export const openBills = query({
   args: { token: v.string(), outletId: v.id("outlets") },
   handler: async (ctx, { token, outletId }) => {
     const { outletId: oid } = await requireOutlet(ctx, token, outletId);
-    const recent = await ctx.db
-      .query("restaurant_orders")
-      .withIndex("by_outlet", (q) => q.eq("outlet_id", oid))
-      .order("desc")
-      .take(500);
-
-    const open = recent.filter(
-      (o) => o.status !== "paid" && o.status !== "cancelled"
-    );
+    const open = await collectOpenOrders(ctx, oid);
 
     return Promise.all(
       open.map(async (o) => {
@@ -455,6 +451,9 @@ async function reconcileOrderPaidState(
     );
     const snapshot_method =
       last.method === "online" ? "upi" : (last.method as "cash" | "card" | "upi");
+    if (order.status !== "paid") {
+      await bumpOutletRevenue(ctx, order.outlet_id, order.total);
+    }
     await ctx.db.patch(orderId, {
       status: "paid",
       payment_method: snapshot_method,
@@ -469,6 +468,7 @@ async function reconcileOrderPaidState(
   } else if (order.status === "paid") {
     // A payment was removed and the order is no longer fully covered —
     // revert to "served" so the cashier can record more payments.
+    await bumpOutletRevenue(ctx, order.outlet_id, -order.total);
     await ctx.db.patch(orderId, {
       status: "served",
       payment_method: undefined,
@@ -643,6 +643,10 @@ export const updateStatus = mutation({
       );
     }
 
+    // Manual served → paid flip (no payment rows) still counts as revenue.
+    if (status === "paid") {
+      await bumpOutletRevenue(ctx, order.outlet_id, order.total);
+    }
     await ctx.db.patch(id, { status });
 
     // Free the table when order is paid or cancelled

@@ -11,6 +11,7 @@
 import { internalMutation, internalQuery, MutationCtx, QueryCtx } from "./_generated/server";
 import { Doc, Id } from "./_generated/dataModel";
 import { v } from "convex/values";
+import { bumpOutletRevenue } from "./lib/revenue";
 
 // ─── Session resolution ───────────────────────────────────────────────────────
 
@@ -533,6 +534,11 @@ export const updateOrderStatus = internalMutation({
   handler: async (ctx, { order_id, status }) => {
     const order = await ctx.db.get(order_id);
     if (!order) throw new Error("Order not found");
+    // This path can move a paid order away from "paid" (no transition guard;
+    // the validator never accepts "paid"), so keep the revenue counter honest.
+    if (order.status === "paid") {
+      await bumpOutletRevenue(ctx, order.outlet_id, -order.total);
+    }
     await ctx.db.patch(order_id, { status });
     // Free table if cancelled. (Payment flips paid+frees via reconcile path.)
     if (status === "cancelled" && order.table_id) {
